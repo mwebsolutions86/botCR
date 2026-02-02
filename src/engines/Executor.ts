@@ -3,20 +3,38 @@ import {
     Keypair, 
     PublicKey, 
     VersionedTransaction, 
-    SystemProgram, 
-    TransactionMessage 
+    TransactionMessage, 
+    TransactionInstruction,
+    SystemProgram,
+    SYSVAR_RENT_PUBKEY,
+    ComputeBudgetProgram
 } from '@solana/web3.js';
-import bs58 from 'bs58'; // ✅ FIX : Import par défaut (le paquet entier)
+import { 
+    getAssociatedTokenAddress, 
+    createAssociatedTokenAccountInstruction, 
+    TOKEN_PROGRAM_ID, 
+    ASSOCIATED_TOKEN_PROGRAM_ID 
+} from '@solana/spl-token';
+import bs58 from 'bs58';
 import axios from 'axios';
 import { logger } from '../utils/Logger.js';
 import dotenv from 'dotenv';
+import { Buffer } from 'buffer';
 
 dotenv.config();
 
-// --- CONSTANTES ---
-const JUPITER_QUOTE_API = 'https://quote-api.jup.ag/v6';
+const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const GLOBAL_ACCOUNT = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqPkpGGTJ1coy1vJm1pump");
+const FEE_RECIPIENT = new PublicKey("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM");
+const EVENT_AUTHORITY = new PublicKey("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjxc7UyXVxv");
 
-// Comptes de "Pourboire" Jito
+const JITO_ENGINES = [
+    "https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles",
+    "https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles"
+];
+
 const JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "Hf3aaSbmJf8cxXHXpH37UYoY81af7yyPWWb5XtwYHMx7",
@@ -27,140 +45,136 @@ const JITO_TIP_ACCOUNTS = [
 export class Executor {
     private connection: Connection;
     private wallet: Keypair;
-    private jitoUrl: string;
 
     constructor() {
         this.connection = new Connection(process.env.RPC_URL || 'https://api.mainnet-beta.solana.com');
-        
         const privKey = process.env.PRIVATE_KEY;
-        if (!privKey) {
-            logger.error("CRITICAL: PRIVATE_KEY manquante dans le fichier .env");
-            process.exit(1);
-        }
+        if (!privKey) { process.exit(1); }
+        this.wallet = Keypair.fromSecretKey(bs58.decode(privKey));
+    }
 
-        try {
-            // ✅ FIX : Utilisation de bs58.decode() au lieu de decode()
-            this.wallet = Keypair.fromSecretKey(bs58.decode(privKey));
-        } catch (err) {
-            logger.error("CRITICAL: Clé privée invalide (Erreur de décodage Base58)");
-            throw err;
-        }
-        
-        this.jitoUrl = process.env.JITO_BLOCK_ENGINE_URL || 'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles';
+    private getRandomJitoUrl(): string {
+        return JITO_ENGINES[Math.floor(Math.random() * JITO_ENGINES.length)];
     }
 
     public async executeTrade(inputMint: string, outputMint: string, amountRaw: number): Promise<boolean> {
-        // --- MODE SIMULATION (DÉCOMMENTER POUR LE TEST DRY RUN) ---
-        /*
-        logger.info(`Executor 🧪 [SIMULATION]: Demande de trade ${inputMint} -> ${outputMint} | Montant: ${amountRaw}`);
-        await new Promise(resolve => setTimeout(resolve, 100));
-        logger.info(`Executor 🧪 [SIMULATION]: Trade "virtuellement" confirmé !`);
-        return true;
-        */
-        // ---------------------------------------------------------
+        if (inputMint !== 'So11111111111111111111111111111111111111112') return false;
 
         try {
-            logger.info(`Executor ⚙️: Calcul de route ${inputMint} -> ${outputMint} (${amountRaw})`);
+            logger.info(`Executor ⚡: Construction TX Locale pour ${outputMint}...`);
 
-            const quote = await this.getJupiterQuote(inputMint, outputMint, amountRaw);
-            if (!quote) return false;
+            const mint = new PublicKey(outputMint);
+            const owner = this.wallet.publicKey;
 
-            const swapTransaction = await this.getSwapTransaction(quote);
-            if (!swapTransaction) return false;
+            // 1. Calcul adresses
+            const [bondingCurve] = PublicKey.findProgramAddressSync(
+                [Buffer.from("bonding-curve"), mint.toBuffer()], PUMP_PROGRAM
+            );
+            const [assocBondingCurve] = PublicKey.findProgramAddressSync(
+                [bondingCurve.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()], ASSOCIATED_TOKEN_PROGRAM_ID
+            );
 
-            const bundleId = await this.sendJitoBundle(swapTransaction);
+            // 2. Calcul Prix (Bonding Curve)
+            const curveAccount = await this.connection.getAccountInfo(bondingCurve);
+            if (!curveAccount) return false;
+
+            const data = curveAccount.data;
+            const virtualTokenReserves = data.readBigUInt64LE(8);
+            const virtualSolReserves = data.readBigUInt64LE(16);
             
-            if (bundleId) {
-                logger.info(`Executor 🚀: Bundle envoyé avec succès ! ID: ${bundleId}`);
-                return true;
-            } else {
-                logger.error("Executor ❌: Échec de l'envoi du bundle Jito.");
-                return false;
+            const solIn = BigInt(amountRaw);
+            const tokenOut = (virtualTokenReserves * solIn) / (virtualSolReserves + solIn);
+
+            // ⚠️ MODIFICATION MAJEURE : SLIPPAGE AGRESSIF (50%)
+            // On accepte de recevoir beaucoup moins de tokens que prévu si le prix bouge.
+            // Cela garantit que la transaction ne "fail" pas à cause d'un changement de prix minime.
+            const minTokensOut = (tokenOut * BigInt(50)) / BigInt(100); 
+
+            logger.info(`Executor 📐: Mise: ${(Number(solIn)/1e9).toFixed(4)} SOL | Tokens attendus: ~${tokenOut} (Min: ${minTokensOut})`);
+
+            // 3. Instructions
+            const instructions: TransactionInstruction[] = [];
+
+            instructions.push(ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 150000 })); // Frais priorité augmentés
+            instructions.push(ComputeBudgetProgram.setComputeUnitLimit({ units: 100000 }));
+
+            const userTokenAccount = await getAssociatedTokenAddress(mint, owner);
+            const accountInfo = await this.connection.getAccountInfo(userTokenAccount);
+            if (!accountInfo) {
+                instructions.push(createAssociatedTokenAccountInstruction(owner, userTokenAccount, owner, mint));
             }
 
-        } catch (error) {
-            logger.error(`Executor: Crash critique lors du trade`, error);
-            return false;
-        }
-    }
+            // BUY Instruction
+            const discriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 239]); 
+            const amountBuffer = Buffer.alloc(8);
+            const maxSolBuffer = Buffer.alloc(8);
 
-    private async getJupiterQuote(inputMint: string, outputMint: string, amount: number) {
-        try {
-            const url = `${JUPITER_QUOTE_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${Math.floor(amount)}&slippageBps=50`;
-            const response = await axios.get(url);
-            return response.data;
-        } catch (error) {
-            logger.error("Executor: Erreur Jupiter Quote", error);
-            return null;
-        }
-    }
+            // On demande le montant MINIMUM de tokens (minTokensOut)
+            // Et on dit qu'on paie le montant EXACT de SOL (solIn)
+            // C'est l'inverse de la logique précédente, c'est plus robuste sur Pump.fun
+            amountBuffer.writeBigUInt64LE(tokenOut); 
+            const maxSolWithSlippage = (solIn * BigInt(120)) / BigInt(100); // On autorise 20% de SOL en plus au pire
+            maxSolBuffer.writeBigUInt64LE(maxSolWithSlippage);
 
-    private async getSwapTransaction(quoteResponse: any): Promise<VersionedTransaction | null> {
-        try {
-            const response = await axios.post(`${JUPITER_QUOTE_API}/swap`, {
-                quoteResponse,
-                userPublicKey: this.wallet.publicKey.toString(),
-                wrapAndUnwrapSol: true,
-            });
-            
-            const swapTransactionBuf = Buffer.from(response.data.swapTransaction, 'base64');
-            const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-            transaction.sign([this.wallet]);
-            
-            return transaction;
-        } catch (error) {
-            logger.error("Executor: Erreur Swap Tx", error);
-            return null;
-        }
-    }
+            const txData = Buffer.concat([discriminator, amountBuffer, maxSolBuffer]);
 
-    private async sendJitoBundle(swapTransaction: VersionedTransaction): Promise<string | null> {
-        try {
+            const keys = [
+                { pubkey: GLOBAL_ACCOUNT, isSigner: false, isWritable: false },
+                { pubkey: FEE_RECIPIENT, isSigner: false, isWritable: true },
+                { pubkey: mint, isSigner: false, isWritable: false },
+                { pubkey: bondingCurve, isSigner: false, isWritable: true },
+                { pubkey: assocBondingCurve, isSigner: false, isWritable: true },
+                { pubkey: userTokenAccount, isSigner: false, isWritable: true },
+                { pubkey: owner, isSigner: true, isWritable: true },
+                { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+                { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+                { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+                { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+                { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+            ];
+
+            instructions.push(new TransactionInstruction({
+                keys, programId: PUMP_PROGRAM, data: txData
+            }));
+
+            // Tip Jito
             const tipAccount = new PublicKey(JITO_TIP_ACCOUNTS[Math.floor(Math.random() * JITO_TIP_ACCOUNTS.length)]);
-            const tipAmount = 100000; // 0.0001 SOL
-            
-            const tipInstruction = SystemProgram.transfer({
-                fromPubkey: this.wallet.publicKey,
-                toPubkey: tipAccount,
-                lamports: tipAmount
-            });
+            instructions.push(SystemProgram.transfer({
+                fromPubkey: owner, toPubkey: tipAccount, lamports: 100000 
+            }));
 
+            // 4. Envoi
             const { blockhash } = await this.connection.getLatestBlockhash("finalized");
             
             const messageV0 = new TransactionMessage({
-                payerKey: this.wallet.publicKey,
-                recentBlockhash: blockhash,
-                instructions: [tipInstruction],
+                payerKey: owner, recentBlockhash: blockhash, instructions,
             }).compileToV0Message();
 
-            const tipTransaction = new VersionedTransaction(messageV0);
-            tipTransaction.sign([this.wallet]);
+            const transaction = new VersionedTransaction(messageV0);
+            transaction.sign([this.wallet]);
 
-            // ✅ FIX : Utilisation de bs58.encode()
-            const b58Swap = bs58.encode(swapTransaction.serialize());
-            const b58Tip = bs58.encode(tipTransaction.serialize());
+            const b58Tx = bs58.encode(transaction.serialize());
+            const jitoUrl = this.getRandomJitoUrl();
 
-            const payload = {
-                jsonrpc: "2.0",
-                id: 1,
-                method: "sendBundle",
-                params: [[b58Swap, b58Tip]]
-            };
+            const payload = { jsonrpc: "2.0", id: 1, method: "sendBundle", params: [[b58Tx]] };
 
-            const response = await axios.post(this.jitoUrl, payload, {
+            const response = await axios.post(jitoUrl, payload, {
                 headers: { 'Content-Type': 'application/json' }
             });
 
             if (response.data.result) {
-                return response.data.result;
-            } else {
-                logger.error("Executor: Erreur API Jito", response.data);
-                return null;
+                logger.info(`Executor 🚀: TRANSACTION ENVOYÉE (Jito: ${jitoUrl.split('//')[1].split('.')[0]})`);
+                return true;
             }
+            return false;
 
-        } catch (error) {
-            logger.error("Executor: Erreur réseau Jito", error);
-            return null;
+        } catch (error: any) {
+            if (error.response && error.response.status === 429) {
+                logger.warn("Executor ⚠️: Jito Rate Limit (429)");
+            } else {
+                logger.error(`Executor: Erreur -> ${error.message}`);
+            }
+            return false;
         }
     }
 }

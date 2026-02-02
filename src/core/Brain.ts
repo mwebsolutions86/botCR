@@ -1,63 +1,86 @@
-import { Connection, PublicKey } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import axios from 'axios';
-import bs58 from 'bs58'; // ✅ AJOUT : Import statique ici aussi
-import { Keypair } from '@solana/web3.js'; // Import statique direct
-import { RaydiumListener } from '../listeners/RaydiumListener.js';
+import bs58 from 'bs58';
+import { RaydiumListener, TokenMetrics } from '../listeners/RaydiumListener.js';
 import { RiskManager } from './RiskManager.js';
 import { StrategyEngine, StrategyAction } from '../engines/Strategy.js';
 import { Executor } from '../engines/Executor.js';
 import { logger } from '../utils/Logger.js';
 import { CONSTANTS, JUPITER_PRICE_API } from '../utils/Constants.js';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 export class Brain {
     private connection: Connection;
+    private wallet: Keypair;
     private listener: RaydiumListener;
     private riskManager: RiskManager;
     private strategy: StrategyEngine;
     private executor: Executor;
 
     private activeMints: Set<string> = new Set();
-    private TOTAL_CAPITAL_SOL = 0.01; // ✅ Capital bas pour le test
 
     constructor() {
         this.connection = new Connection(process.env.RPC_URL || 'https://api.mainnet-beta.solana.com');
         
+        const privKey = process.env.PRIVATE_KEY;
+        if (!privKey) { process.exit(1); }
+        this.wallet = Keypair.fromSecretKey(bs58.decode(privKey));
+
         this.listener = new RaydiumListener(this.connection);
         this.riskManager = new RiskManager(this.connection);
         this.strategy = new StrategyEngine(this.riskManager);
         this.executor = new Executor();
 
-        this.listener.onNewToken = (mint: string) => {
-            this.handleNewToken(mint);
+        // Le listener envoie maintenant un objet 'metrics' complet
+        this.listener.onNewToken = (metrics: TokenMetrics) => {
+            this.handleNewToken(metrics);
         };
     }
 
     public async start() {
-        logger.info("🧠 TITAN BRAIN: Démarrage des systèmes...");
+        const balance = await this.connection.getBalance(this.wallet.publicKey);
+        logger.info(`🧠 TITAN BRAIN: Démarrage... Solde Wallet: ${(balance / 1e9).toFixed(4)} SOL`);
         await this.listener.startListening();
         this.startPriceMonitoringLoop();
-        logger.info("🧠 TITAN BRAIN: Systèmes opérationnels.");
+        logger.info("🧠 TITAN BRAIN: Prêt et en attente d'opportunités.");
     }
 
-    private async handleNewToken(mint: string) {
-        if (this.activeMints.has(mint)) return;
+    private async handleNewToken(metrics: TokenMetrics) {
+        if (this.activeMints.has(metrics.mint)) return;
 
-        logger.info(`Brain ⚡: Analyse du candidat -> ${mint}`);
-        const isSafe = await this.riskManager.validateTokenSafety(mint);
-        
-        if (!isSafe) {
-            logger.warn(`Brain 🛡️: Token ${mint} REJETÉ.`);
+        logger.info(`Brain ⚡: Analyse Approfondie -> ${metrics.name} (${metrics.mint})`);
+
+        // ÉTAPE 1 : Validation Financière (MC, Liq, Tx) - Très rapide
+        const isFinanciallyViable = this.riskManager.validateMarketMetrics(metrics);
+        if (!isFinanciallyViable) return;
+
+        // ÉTAPE 2 : Validation Sécurité (RugCheck / Analystes) - Un peu plus long (~1s)
+        const isSafe = await this.riskManager.checkRugCheckScore(metrics.mint);
+        if (!isSafe) return;
+
+        // ÉTAPE 3 : Vérification Budget
+        const balanceLamports = await this.connection.getBalance(this.wallet.publicKey);
+        const balanceSol = balanceLamports / 1_000_000_000;
+
+        if (balanceSol < 0.002) {
+            logger.warn(`Brain ⚠️: Solde insuffisant (${balanceSol.toFixed(4)} SOL).`);
             return;
         }
 
-        const { entrySize } = this.riskManager.getTradeConfiguration('INITIAL_LAUNCH', this.TOTAL_CAPITAL_SOL);
+        // ÉTAPE 4 : Calcul de la mise (10%)
+        const { entrySize } = this.riskManager.getTradeConfiguration('INITIAL_LAUNCH', balanceSol);
         const amountLamports = Math.floor(entrySize * 1_000_000_000); 
 
-        const buySuccess = await this.executor.executeTrade(CONSTANTS.SOL_MINT, mint, amountLamports);
+        logger.info(`Brain 💰: Validation Totale OK. Tir de ${entrySize} SOL sur ${metrics.name}`);
+
+        // ÉTAPE 5 : Exécution
+        const buySuccess = await this.executor.executeTrade(CONSTANTS.SOL_MINT, metrics.mint, amountLamports);
 
         if (buySuccess) {
-            this.activeMints.add(mint);
-            logger.info(`Brain 🚀: Achat INITIAL confirmé sur ${mint}.`);
+            this.activeMints.add(metrics.mint);
+            logger.info(`Brain 🚀: ACHAT CONFIRMÉ sur ${metrics.name}`);
         }
     }
 
@@ -78,57 +101,30 @@ export class Brain {
                 if (action === 'SELL_EXIT') {
                     await this.executeSell(mint);
                 } 
-                else if (action === 'BUY_REBOUND') {
-                    await this.executeReboundBuy(mint);
-                }
             }
         }, CONSTANTS.PRICE_CHECK_INTERVAL_MS);
     }
 
     private async executeSell(mint: string) {
-        logger.info(`Brain 📉: Exécution VENTE TOTALE pour ${mint}`);
-        
+        logger.info(`Brain 📉: VENTE DÉCLENCHÉE pour ${mint}`);
         const tokenBalance = await this.getTokenBalance(mint);
-
-        if (tokenBalance <= 0) {
-            logger.warn(`Brain: Tentative de vente sur ${mint} mais solde = 0.`);
-            // this.activeMints.delete(mint); // Optionnel : retirer de la liste
-            return;
-        }
+        if (tokenBalance <= 0) return;
 
         const success = await this.executor.executeTrade(mint, CONSTANTS.SOL_MINT, tokenBalance);
-
         if (success) {
-            logger.info(`Brain ✅: Vente confirmée pour ${mint}.`);
+            logger.info(`Brain ✅: Position clôturée.`);
+            this.activeMints.delete(mint);
         }
-    }
-
-    private async executeReboundBuy(mint: string) {
-        logger.info(`Brain 📈: Exécution ACHAT REBOND pour ${mint}`);
-        const { entrySize } = this.riskManager.getTradeConfiguration('REBOUND_ENTRY', this.TOTAL_CAPITAL_SOL);
-        const amountLamports = Math.floor(entrySize * 1_000_000_000);
-        const success = await this.executor.executeTrade(CONSTANTS.SOL_MINT, mint, amountLamports);
-        if (success) logger.info(`Brain ✅: Achat Rebond confirmé sur ${mint}.`);
     }
 
     private async getTokenBalance(mint: string): Promise<number> {
         try {
-            // ✅ FIX: On utilise l'import statique bs58 défini en haut du fichier
-            // Plus besoin d'import dynamique ici
-            const wallet = Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY!));
-
             const accounts = await this.connection.getParsedTokenAccountsByOwner(
-                wallet.publicKey,
-                { mint: new PublicKey(mint) }
+                this.wallet.publicKey, { mint: new PublicKey(mint) }
             );
-
             if (accounts.value.length === 0) return 0;
-
-            const tokenAmount = accounts.value[0].account.data.parsed.info.tokenAmount;
-            return Number(tokenAmount.amount); 
-
+            return Number(accounts.value[0].account.data.parsed.info.tokenAmount.amount); 
         } catch (error) {
-            logger.error(`Brain: Erreur lecture solde pour ${mint}`, error);
             return 0;
         }
     }
@@ -145,7 +141,6 @@ export class Brain {
             }
             return prices;
         } catch (error) {
-            logger.error("Brain: Erreur Jupiter Price API");
             return {};
         }
     }

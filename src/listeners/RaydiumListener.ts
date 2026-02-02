@@ -4,9 +4,20 @@ import { logger } from '../utils/Logger.js';
 
 const NEW_POOLS_API = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools";
 
+// Structure des données financières
+export interface TokenMetrics {
+    mint: string;
+    name: string;
+    marketCap: number;
+    liquidity: number;
+    volumeM5: number;   // Volume des 5 dernières minutes
+    txCountM5: number;  // Nombre de transactions (5 min)
+    poolAge: number;    // En minutes
+}
+
 export class RaydiumListener {
     private connection: Connection;
-    public onNewToken?: (mint: string) => void;
+    public onNewToken?: (metrics: TokenMetrics) => void;
     private isScanning = false;
     private processedMints: Set<string> = new Set();
 
@@ -15,12 +26,12 @@ export class RaydiumListener {
     }
 
     public async startListening() {
-        logger.info("🎧 RaydiumListener: MODE HYBRIDE (Raydium + Pump.fun).");
-        logger.info("📡 Vannes ouvertes : On tire sur tout ce qui bouge.");
+        logger.info("🎧 RaydiumListener: Mode ANALYSTE (GeckoTerminal).");
+        logger.info("📊 Suivi: MarketCap, Liq, Volume, Transactions...");
 
         setInterval(async () => {
             await this.scanGeckoTerminal();
-        }, 6000); // 6s pour être safe avec Gecko
+        }, 3000); 
     }
 
     private async scanGeckoTerminal() {
@@ -35,49 +46,53 @@ export class RaydiumListener {
             const pools = response.data.data;
             if (!pools || pools.length === 0) return;
 
-            logger.info(`✅ RADAR OK: ${pools.length} pools. Dernier: ${pools[0].attributes.name}`);
-
             for (const pool of pools) {
-                const name = pool.attributes.name;
                 const dexId = pool.relationships?.dex?.data?.id; 
+                // On accepte Raydium et Pump.fun (si indexé)
+                if (dexId !== 'raydium' && dexId !== 'pump-fun') continue;
 
-                // --- 🔓 MODIFICATION CRITIQUE ICI ---
-                // On accepte 'raydium' ET 'pump-fun'
-                if (dexId !== 'raydium' && dexId !== 'pump-fun') {
-                    // logger.warn(`❌ REJETÉ: Dex inconnu (${dexId}) pour ${name}`);
-                    continue; 
-                }
-
-                // Extraction Mint
                 const baseTokenId = pool.relationships?.base_token?.data?.id; 
                 if (!baseTokenId) continue;
                 const mint = baseTokenId.replace('solana_', '');
 
-                // Vérification si déjà traité
                 if (this.processedMints.has(mint)) continue;
 
-                // Calcul Âge
+                // --- EXTRACTION DES DONNÉES ANALYTIQUES ---
                 const createdAt = new Date(pool.attributes.pool_created_at).getTime();
-                const ageMin = ((Date.now() - createdAt) / 1000 / 60).toFixed(0);
+                const ageMin = (Date.now() - createdAt) / 1000 / 60;
+                
+                // On ignore les tokens trop vieux (> 60 min) pour ce bot de sniping
+                if (ageMin > 60) continue;
 
-                // LOG DE SUCCÈS
-                logger.info(`🚨 CIBLE VALIDÉE (${dexId}): ${name} | Âge: ${ageMin} min`);
-                logger.info(`🔫 TIR DÉCLENCHÉ -> Envoi au Brain...`);
+                const fdv = parseFloat(pool.attributes.fdv_usd || '0'); // Market Cap
+                const liq = parseFloat(pool.attributes.reserve_in_usd || '0'); // Liquidité
+                const volM5 = parseFloat(pool.attributes.volume_usd?.m5 || '0'); // Volume 5 min
+                
+                const txBuy = pool.attributes.transactions?.m5?.buys || 0;
+                const txSell = pool.attributes.transactions?.m5?.sells || 0;
+                const totalTx = txBuy + txSell;
+
+                const metrics: TokenMetrics = {
+                    mint: mint,
+                    name: pool.attributes.name,
+                    marketCap: fdv,
+                    liquidity: liq,
+                    volumeM5: volM5,
+                    txCountM5: totalTx,
+                    poolAge: ageMin
+                };
+
+                logger.info(`🚨 DETECTÉ: ${metrics.name} | MC: $${fdv.toFixed(0)} | Liq: $${liq.toFixed(0)} | Tx(5m): ${totalTx}`);
 
                 this.processedMints.add(mint);
                 
                 if (this.onNewToken) {
-                    this.onNewToken(mint);
-                    
-                    // Pause de sécurité après un tir pour laisser le temps au Brain de traiter
-                    await new Promise(r => setTimeout(r, 1000));
-                    // On sort de la boucle pour ne pas en acheter 20 d'un coup
+                    this.onNewToken(metrics); // On envoie le dossier complet au Cerveau
                     break; 
                 }
             }
-
         } catch (error: any) {
-            logger.error(`Erreur: ${error.message}`);
+            // logger.error(`Erreur Listener: ${error.message}`);
         } finally {
             this.isScanning = false;
         }
