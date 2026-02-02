@@ -1,178 +1,81 @@
 import { RiskManager } from '../core/RiskManager.js';
 import { logger } from '../utils/Logger.js';
 
-// --- TYPES ---
-export interface Candle {
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    timestamp: number;
-    isClosed: boolean;
-}
+export type StrategyAction = 'BUY' | 'SELL_EXIT' | 'HOLD';
 
-// ✅ NOUVEAU : Les ordres que la stratégie peut donner au Brain
-export type StrategyAction = 'HOLD' | 'SELL_EXIT' | 'BUY_REBOUND';
-
-export interface TokenState {
-    mint: string;
-    phase: 'MONITORING' | 'BOUGHT_INITIAL' | 'STOP_LOSS_HIT' | 'WAITING_FOR_REBOUND' | 'BOUGHT_REBOUND' | 'EXITED';
-    candles: Candle[];
-    currentCandle: Candle | null;
-    highestPrice: number;
+interface PositionState {
     entryPrice: number;
-    stopLossPrice: number;
+    highestPrice: number; // Le sommet atteint (ATH local)
+    stopLoss: number;     // Le prix de déclenchement de la vente
+    entryTime: number;
 }
 
 export class StrategyEngine {
-    private activeTokens: Map<string, TokenState> = new Map();
     private riskManager: RiskManager;
-    
-    // CONFIGURATION
-    private readonly TIMEFRAME_MS = 60 * 1000; // 1 minute
-    private readonly RSI_PERIOD = 14;
-    private readonly RSI_OVERSOLD_THRESHOLD = 30;
+    // Mémoire des positions actives
+    private positions: Map<string, PositionState> = new Map();
 
     constructor(riskManager: RiskManager) {
         this.riskManager = riskManager;
     }
 
-    /**
-     * Point d'entrée principal : Retourne une ACTION à exécuter immédiatement
-     */
-    public async onPriceUpdate(mint: string, price: number, timestamp: number): Promise<StrategyAction> {
-        let state = this.activeTokens.get(mint);
-        let action: StrategyAction = 'HOLD';
-
-        // Initialisation (Si le token n'est pas encore suivi par la stratégie)
-        if (!state) {
-            state = this.initializeTokenState(mint, price);
-            this.activeTokens.set(mint, state);
-            // On considère qu'on vient d'acheter la phase initiale
-            state.phase = 'BOUGHT_INITIAL'; 
-            // Premier SL fixé par le RiskManager pour la phase initiale
-            const config = this.riskManager.getTradeConfiguration('INITIAL_LAUNCH', 0); // Capital ignoré ici, on veut juste le %
-            state.stopLossPrice = price * (1 - config.stopLoss);
+    public async onPriceUpdate(mint: string, currentPrice: number, now: number): Promise<StrategyAction> {
+        // 1. INITIALISATION (Premier contact avec le Token)
+        if (!this.positions.has(mint)) {
+            // On récupère la config du RiskManager (Stop Loss initial de 25% par exemple)
+            const config = this.riskManager.getTradeConfiguration(mint, 0); 
+            const initialStopPrice = currentPrice * (1 - config.stopLoss);
+            
+            this.positions.set(mint, {
+                entryPrice: currentPrice,
+                highestPrice: currentPrice,
+                stopLoss: initialStopPrice,
+                entryTime: now
+            });
+            
+            logger.info(`Strategy 🏁: Suivi démarré pour ${mint} à $${currentPrice.toFixed(6)} (SL Initial: $${initialStopPrice.toFixed(6)})`);
+            return 'HOLD';
         }
 
-        // 1. Mise à jour des bougies (OHLC)
-        this.updateCandle(state, price, timestamp);
+        const pos = this.positions.get(mint)!;
 
-        // 2. Logique décisionnelle
-        switch (state.phase) {
-            case 'BOUGHT_INITIAL':
-                // Gestion du Trailing Stop
-                if (price > state.highestPrice) {
-                    state.highestPrice = price;
-                    // SL dynamique à 5% (ou autre config)
-                    state.stopLossPrice = this.riskManager.updateTrailingStop(price, state.highestPrice, 0.05);
-                }
+        // 2. MISE À JOUR DU SOMMET (Trailing)
+        // Si le prix monte plus haut que jamais, on met à jour le sommet
+        if (currentPrice > pos.highestPrice) {
+            pos.highestPrice = currentPrice;
 
-                // Vérification STOP LOSS
-                if (price <= state.stopLossPrice) {
-                    logger.warn(`Strategy 🛑: SL touché sur ${mint} (Initial). Signal VENTE envoyé.`);
-                    state.phase = 'WAITING_FOR_REBOUND'; // On passe en attente
-                    action = 'SELL_EXIT';
-                }
-                break;
-
-            case 'WAITING_FOR_REBOUND':
-                // On a vendu, on attend un signal pour racheter
-                if (this.checkReboundConditions(state)) {
-                    logger.info(`Strategy 🚀: SIGNAL REBOND VALIDÉ sur ${mint} !`);
-                    
-                    // On prépare l'état pour l'après-achat
-                    state.phase = 'BOUGHT_REBOUND';
-                    state.entryPrice = price;
-                    state.highestPrice = price;
-                    
-                    // SL plus serré pour le rebond (ex: 2.5%)
-                    state.stopLossPrice = price * (1 - 0.025); 
-                    
-                    action = 'BUY_REBOUND';
-                }
-                break;
-                
-            case 'BOUGHT_REBOUND':
-                // Gestion après le 2ème achat (SL Strict)
-                if (price <= state.stopLossPrice) {
-                    logger.warn(`Strategy 💀: SL Rebond touché sur ${mint}. Sortie définitive.`);
-                    state.phase = 'EXITED';
-                    this.activeTokens.delete(mint); // On arrête de suivre ce token
-                    action = 'SELL_EXIT';
-                }
-                // Ici on pourrait ajouter un Trailing Stop aussi pour le rebond
-                if (price > state.highestPrice) {
-                    state.highestPrice = price;
-                    state.stopLossPrice = this.riskManager.updateTrailingStop(price, state.highestPrice, 0.025);
-                }
-                break;
+            // APPEL AU RISK MANAGER : "Le prix a monté, dois-je remonter le Stop Loss ?"
+            // C'est ici que la magie du "Gem" opère : on sécurise les gains en montant l'échelle.
+            const newStopLoss = this.riskManager.updateTrailingStop(currentPrice, pos.entryPrice, pos.stopLoss);
+            
+            if (newStopLoss > pos.stopLoss) {
+                logger.info(`Strategy 📈: GEM DETECTÉ ! Stop Loss remonté à $${newStopLoss.toFixed(6)} (Sécurisation gains)`);
+                pos.stopLoss = newStopLoss;
+            }
         }
 
-        return action;
-    }
-
-    // --- LOGIQUE INTERNE (Déjà vue précédemment) ---
-
-    private checkReboundConditions(state: TokenState): boolean {
-        if (state.candles.length < 3) return false;
-        const last = state.candles[state.candles.length - 1];
-        const prev = state.candles[state.candles.length - 2];
-        const rsi = this.calculateRSI(state.candles);
-
-        // RSI < 30
-        if (rsi > this.RSI_OVERSOLD_THRESHOLD) return false;
-
-        // Bougie Englobante (Bullish Engulfing)
-        const isBullishEngulfing = 
-            prev.close < prev.open && // Précédente rouge
-            last.close > last.open && // Actuelle verte
-            last.open <= prev.close && 
-            last.close >= prev.open;
-
-        return isBullishEngulfing;
-    }
-
-    private updateCandle(state: TokenState, price: number, timestamp: number) {
-        if (!state.currentCandle) {
-            state.currentCandle = { open: price, high: price, low: price, close: price, volume: 0, timestamp, isClosed: false };
-            return;
-        }
-        const startTime = Math.floor(timestamp / this.TIMEFRAME_MS) * this.TIMEFRAME_MS;
+        // Calcul du PnL (Profit/Perte) actuel en %
+        const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
         
-        if (state.currentCandle.timestamp < startTime) {
-            state.currentCandle.isClosed = true;
-            state.candles.push(state.currentCandle);
-            if (state.candles.length > 50) state.candles.shift();
-            state.currentCandle = { open: price, high: price, low: price, close: price, volume: 0, timestamp: startTime, isClosed: false };
-        } else {
-            state.currentCandle.close = price;
-            state.currentCandle.high = Math.max(state.currentCandle.high, price);
-            state.currentCandle.low = Math.min(state.currentCandle.low, price);
+        // 3. VÉRIFICATION DE SORTIE (Le prix est-il passé sous le filet de sécurité ?)
+        if (currentPrice <= pos.stopLoss) {
+            if (pnlPercent > 0) {
+                logger.info(`Strategy 💰: TAKE PROFIT ! Vente à $${currentPrice.toFixed(6)} (+${pnlPercent.toFixed(2)}%)`);
+            } else {
+                logger.info(`Strategy 🛡️: STOP LOSS ! Vente à $${currentPrice.toFixed(6)} (${pnlPercent.toFixed(2)}%)`);
+            }
+            
+            this.positions.delete(mint);
+            return 'SELL_EXIT';
         }
-    }
 
-    private calculateRSI(candles: Candle[]): number {
-        if (candles.length < this.RSI_PERIOD + 1) return 50;
-        let gains = 0, losses = 0;
-        for (let i = candles.length - this.RSI_PERIOD; i < candles.length; i++) {
-            const diff = candles[i].close - candles[i - 1].close;
-            (diff >= 0) ? gains += diff : losses -= diff;
+        // 4. LOGS DE SUIVI (Pour que tu voies ton Gem grandir)
+        // On log uniquement si le mouvement est significatif ou aléatoirement pour ne pas spammer
+        if (Math.abs(pnlPercent) > 5 || Math.random() < 0.1) { 
+            const distanceToSL = ((currentPrice - pos.stopLoss) / currentPrice) * 100;
+            logger.info(`Strategy 👀: ${mint} | Prix: $${currentPrice.toFixed(6)} | PnL: ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(2)}% | SL à -${distanceToSL.toFixed(1)}%`);
         }
-        if (losses === 0) return 100;
-        return 100 - (100 / (1 + (gains / losses)));
-    }
 
-    private initializeTokenState(mint: string, price: number): TokenState {
-        return {
-            mint,
-            phase: 'MONITORING',
-            candles: [],
-            currentCandle: null,
-            highestPrice: price,
-            entryPrice: price,
-            stopLossPrice: 0
-        };
+        return 'HOLD';
     }
 }
