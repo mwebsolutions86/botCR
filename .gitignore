@@ -1,0 +1,12 @@
+# Dépendances (lourd et inutile sur git)
+node_modules/
+
+# Build (généré automatiquement)
+dist/
+
+# SÉCURITÉ (NE JAMAIS ENLEVER ÇA)
+.env
+
+# Logs et système
+*.log
+.DS_Store

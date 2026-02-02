@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    /* Modules & Target */
+    "target": "ES2022",               /* Cible Node.js moderne */
+    "module": "NodeNext",             /* Indispensable pour le "type": "module" */
+    "moduleResolution": "NodeNext",   /* Résolution correcte des imports ESM */
+    "verbatimModuleSyntax": false,    /* On désactive cette règle trop stricte pour l'instant */
+    
+    /* Paths */
+    "outDir": "./dist",
+    "rootDir": "./src",
+    
+    /* Interopérabilité */
+    "esModuleInterop": true,          /* Permet d'importer des libs CommonJS (comme winston) */
+    "forceConsistentCasingInFileNames": true,
+    
+    /* Strict Type-Checking (Sécurité financière) */
+    "strict": true,
+    "noImplicitAny": true,            /* Interdit le 'any' implicite */
+    "strictNullChecks": true,         /* Évite les crashs 'undefined is not a function' */
+    
+    /* Libraries */
+    "lib": ["ES2022"],
+    "skipLibCheck": true              /* Accélère la compilation en ignorant les libs node_modules */
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
